@@ -1,0 +1,15 @@
+[Unit]
+Description=Power Failure Recovery Daemon
+After=multi-user.target
+
+[Service]
+Type=simple
+User=root
+ExecStart=/usr/local/bin/power-recovery
+Restart=always
+RestartSec=10
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,844 @@
+package main
+
+import (
+	"encoding/json"
+	"flag"
+	"fmt"
+	"log"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"sort"
+	"strings"
+	"syscall"
+	"time"
+
+	"github.com/distatus/battery"
+)
+
+// ============================================================
+// Configuration
+// ============================================================
+
+type Config struct {
+	CheckpointInterval int     `json:"checkpoint_interval_secs"`
+	AggressiveInterval int     `json:"aggressive_interval_secs"`
+	EmergencyInterval  int     `json:"emergency_interval_secs"`
+	MinBatteryPercent  float64 `json:"min_battery_percent"`
+	FastDischargeRate  float64 `json:"fast_discharge_rate_per_min"`
+	DataDir            string  `json:"data_dir"`
+	MaxCheckpoints     int     `json:"max_checkpoints"`
+	DryRun             bool
+	RestoreOnStartup   bool
+	Debug              bool
+}
+
+// ============================================================
+// Data Structures
+// ============================================================
+
+type BatterySample struct {
+	Timestamp time.Time `json:"timestamp"`
+	Percent   float64   `json:"percent"`
+	Voltage   int       `json:"voltage_mv"`
+	Current   int       `json:"current_ma"`
+	Status    string    `json:"status"`
+}
+
+type DischargeInfo struct {
+	RatePerMinute float64 `json:"rate_per_minute"`
+	IsFast        bool    `json:"is_fast"`
+	TimeRemaining int64   `json:"time_remaining_secs"`
+}
+
+type Process struct {
+	PID     int    `json:"pid"`
+	Name    string `json:"name"`
+	Command string `json:"command"`
+	CWD     string `json:"cwd"`
+}
+
+type Checkpoint struct {
+	Version        int            `json:"version"`
+	Timestamp      time.Time      `json:"timestamp"`
+	SaveReason     string         `json:"save_reason"`
+	BatteryPercent float64        `json:"battery_percent"`
+	BatteryVoltage int            `json:"battery_voltage_mv"`
+	DischargeRate  float64        `json:"discharge_rate_per_min"`
+	ACOnline       bool           `json:"ac_online"`
+	Processes      []Process      `json:"processes"`
+	ActiveWindows  []ActiveWindow `json:"active_windows,omitempty"`
+}
+
+type ActiveWindow struct {
+	Title string `json:"title"`
+	Class string `json:"class"`
+	PID   int    `json:"pid"`
+}
+
+// ============================================================
+// Battery Monitor - Fixed Version
+// ============================================================
+
+type BatteryMonitor struct {
+	samples                []BatterySample
+	fastDischargeThreshold float64
+	minBatteryThreshold    float64
+	lastACStatus           bool
+	lastEventTime          time.Time
+}
+
+func NewBatteryMonitor(fastDischargeThreshold, minBatteryThreshold float64) *BatteryMonitor {
+	return &BatteryMonitor{
+		samples:                make([]BatterySample, 0),
+		fastDischargeThreshold: fastDischargeThreshold,
+		minBatteryThreshold:    minBatteryThreshold,
+		lastACStatus:           true,
+		lastEventTime:          time.Now(),
+	}
+}
+
+// Convert battery state to string
+func stateToString(state battery.AgnosticState) string {
+	switch state {
+	case battery.Charging:
+		return "Charging"
+	case battery.Discharging:
+		return "Discharging"
+	case battery.Full:
+		return "Full"
+	case battery.Empty:
+		return "Empty"
+	default:
+		return "Unknown"
+	}
+}
+
+func (bm *BatteryMonitor) Read() (*BatterySample, error) {
+	batteries, err := battery.GetAll()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read battery: %w", err)
+	}
+
+	if len(batteries) == 0 {
+		return nil, fmt.Errorf("no battery found")
+	}
+
+	bat := batteries[0]
+
+	// Calculate percentage
+	var percent float64
+	if bat.Full > 0 {
+		percent = float64(bat.Current) / float64(bat.Full) * 100
+	}
+
+	// Convert state to string using the corrected type
+	status := stateToString(bat.State)
+
+	sample := &BatterySample{
+		Timestamp: time.Now(),
+		Percent:   percent,
+		Voltage:   int(bat.Voltage) / 1000, // Convert to mV
+		Current:   int(bat.Current) / 1000, // Convert to mA
+		Status:    status,
+	}
+
+	// Add to samples
+	bm.samples = append(bm.samples, *sample)
+
+	// Keep last 30 samples (5 minutes at 10 second intervals)
+	if len(bm.samples) > 30 {
+		bm.samples = bm.samples[1:]
+	}
+
+	return sample, nil
+}
+
+func (bm *BatteryMonitor) GetDischargeInfo() *DischargeInfo {
+	// Need at least 2 samples
+	if len(bm.samples) < 2 {
+		return &DischargeInfo{RatePerMinute: 0, IsFast: false}
+	}
+
+	// Filter only discharging samples
+	discharging := make([]BatterySample, 0)
+	for _, s := range bm.samples {
+		if s.Status == "Discharging" {
+			discharging = append(discharging, s)
+		}
+	}
+
+	if len(discharging) < 2 {
+		return &DischargeInfo{RatePerMinute: 0, IsFast: false}
+	}
+
+	// Use first and last discharging sample
+	first := discharging[0]
+	last := discharging[len(discharging)-1]
+
+	timeDiff := last.Timestamp.Sub(first.Timestamp).Minutes()
+	percentDiff := first.Percent - last.Percent
+
+	if timeDiff <= 0 || percentDiff <= 0 {
+		return &DischargeInfo{RatePerMinute: 0, IsFast: false}
+	}
+
+	ratePerMinute := percentDiff / timeDiff
+	isFast := ratePerMinute >= bm.fastDischargeThreshold
+
+	// Calculate estimated time remaining (minutes)
+	var timeRemaining int64 = 0
+	if ratePerMinute > 0 {
+		timeRemaining = int64(last.Percent / ratePerMinute * 60)
+	}
+
+	return &DischargeInfo{
+		RatePerMinute: ratePerMinute,
+		IsFast:        isFast,
+		TimeRemaining: timeRemaining,
+	}
+}
+
+func (bm *BatteryMonitor) IsACOnline() bool {
+	batteries, err := battery.GetAll()
+	if err != nil {
+		return true // Assume AC is online if we can't read
+	}
+
+	if len(batteries) == 0 {
+		return true
+	}
+
+	// If battery is not discharging, AC is online (using AgnosticState)
+	return batteries[0].State != battery.Discharging
+}
+
+func (bm *BatteryMonitor) CheckEmergency() bool {
+	if len(bm.samples) == 0 {
+		return false
+	}
+
+	latest := bm.samples[len(bm.samples)-1]
+	acOnline := bm.IsACOnline()
+
+	// Emergency if discharging AND below threshold
+	if !acOnline && latest.Percent <= bm.minBatteryThreshold {
+		return true
+	}
+
+	// Check voltage if available (below 10.5V is critical for most laptop batteries)
+	if latest.Voltage > 0 && latest.Voltage < 10500 && !acOnline {
+		return true
+	}
+
+	return false
+}
+
+// ============================================================
+// Process Monitor
+// ============================================================
+
+type ProcessMonitor struct{}
+
+func NewProcessMonitor() *ProcessMonitor {
+	return &ProcessMonitor{}
+}
+
+func (pm *ProcessMonitor) GetProcesses() ([]Process, error) {
+	processes := make([]Process, 0)
+
+	// Read /proc directory
+	entries, err := os.ReadDir("/proc")
+	if err != nil {
+		return processes, err
+	}
+
+	for _, entry := range entries {
+		if !entry.IsDir() {
+			continue
+		}
+
+		// Check if directory name is a PID (numeric)
+		var pid int
+		_, err := fmt.Sscanf(entry.Name(), "%d", &pid)
+		if err != nil {
+			continue
+		}
+
+		// Read process name from /proc/PID/comm
+		commPath := filepath.Join("/proc", entry.Name(), "comm")
+		name := ""
+		if data, err := os.ReadFile(commPath); err == nil {
+			name = strings.TrimSpace(string(data))
+		}
+
+		// Skip kernel processes (name in brackets)
+		if strings.HasPrefix(name, "[") && strings.HasSuffix(name, "]") {
+			continue
+		}
+
+		// Read command line
+		cmdlinePath := filepath.Join("/proc", entry.Name(), "cmdline")
+		command := name
+		if data, err := os.ReadFile(cmdlinePath); err == nil {
+			if len(data) > 0 {
+				// Replace null bytes with spaces
+				cmd := strings.ReplaceAll(string(data), "\x00", " ")
+				if len(cmd) > 0 {
+					command = cmd
+				}
+			}
+		}
+
+		// Read current working directory
+		cwdPath := filepath.Join("/proc", entry.Name(), "cwd")
+		cwd, err := os.Readlink(cwdPath)
+		if err != nil {
+			cwd = ""
+		}
+
+		// Only include interesting processes (not our daemon, not system idle)
+		if name != "" && name != "power-failure-recovery" && name != "idle" {
+			processes = append(processes, Process{
+				PID:     pid,
+				Name:    name,
+				Command: command,
+				CWD:     cwd,
+			})
+		}
+	}
+
+	// Sort by PID for consistency
+	sort.Slice(processes, func(i, j int) bool {
+		return processes[i].PID < processes[j].PID
+	})
+
+	// Limit to top 100 processes to keep checkpoint size reasonable
+	if len(processes) > 100 {
+		processes = processes[:100]
+	}
+
+	return processes, nil
+}
+
+// ============================================================
+// Window Monitor (Optional)
+// ============================================================
+
+type WindowMonitor struct{}
+
+func NewWindowMonitor() *WindowMonitor {
+	return &WindowMonitor{}
+}
+
+func (wm *WindowMonitor) GetActiveWindows() ([]ActiveWindow, error) {
+	windows := make([]ActiveWindow, 0)
+
+	// Try to use xdotool if available
+	if _, err := exec.LookPath("xdotool"); err == nil {
+		// Get list of windows
+		out, err := exec.Command("xdotool", "search", "--onlyvisible", ".*").Output()
+		if err != nil {
+			return windows, nil
+		}
+
+		for _, windowID := range strings.Split(strings.TrimSpace(string(out)), "\n") {
+			if windowID == "" {
+				continue
+			}
+
+			// Get window title
+			title, _ := exec.Command("xdotool", "getwindowname", windowID).Output()
+
+			// Get window class
+			class, _ := exec.Command("xdotool", "getwindowclassname", windowID).Output()
+
+			// Get window PID
+			pidStr, _ := exec.Command("xdotool", "getwindowpid", windowID).Output()
+			var pid int
+			fmt.Sscanf(strings.TrimSpace(string(pidStr)), "%d", &pid)
+
+			windows = append(windows, ActiveWindow{
+				Title: strings.TrimSpace(string(title)),
+				Class: strings.TrimSpace(string(class)),
+				PID:   pid,
+			})
+		}
+	}
+
+	// Limit to top 20 windows
+	if len(windows) > 20 {
+		windows = windows[:20]
+	}
+
+	return windows, nil
+}
+
+// ============================================================
+// Checkpoint Manager
+// ============================================================
+
+type CheckpointManager struct {
+	dataDir        string
+	maxCheckpoints int
+	dryRun         bool
+}
+
+func NewCheckpointManager(dataDir string, maxCheckpoints int, dryRun bool) *CheckpointManager {
+	return &CheckpointManager{
+		dataDir:        dataDir,
+		maxCheckpoints: maxCheckpoints,
+		dryRun:         dryRun,
+	}
+}
+
+func (cm *CheckpointManager) Save(checkpoint *Checkpoint) error {
+	if cm.dryRun {
+		log.Printf("[DRY RUN] Would save checkpoint: %s", checkpoint.SaveReason)
+		return nil
+	}
+
+	// Create checkpoint file
+	timestamp := checkpoint.Timestamp.Format("20060102_150405")
+	checkpointPath := filepath.Join(cm.dataDir, fmt.Sprintf("checkpoint_%s.json", timestamp))
+	latestPath := filepath.Join(cm.dataDir, "latest_checkpoint.json")
+
+	// Marshal to JSON
+	data, err := json.MarshalIndent(checkpoint, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal checkpoint: %w", err)
+	}
+
+	// Write to temporary file first (atomic write)
+	tmpPath := filepath.Join(cm.dataDir, "checkpoint.tmp")
+	if err := os.WriteFile(tmpPath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write temp file: %w", err)
+	}
+
+	// Rename to actual checkpoint
+	if err := os.Rename(tmpPath, checkpointPath); err != nil {
+		return fmt.Errorf("failed to rename checkpoint: %w", err)
+	}
+
+	// Also update latest
+	if err := os.Rename(tmpPath, latestPath); err != nil {
+		// If rename fails, try copy
+		if err := os.WriteFile(latestPath, data, 0644); err != nil {
+			log.Printf("Warning: failed to update latest checkpoint: %v", err)
+		}
+	}
+
+	// Clean up old checkpoints
+	cm.cleanupOldCheckpoints()
+
+	log.Printf("Checkpoint saved: %s (%.1f%% battery)", checkpoint.SaveReason, checkpoint.BatteryPercent)
+
+	return nil
+}
+
+func (cm *CheckpointManager) LoadLatest() (*Checkpoint, error) {
+	latestPath := filepath.Join(cm.dataDir, "latest_checkpoint.json")
+
+	data, err := os.ReadFile(latestPath)
+	if err != nil {
+		return nil, err
+	}
+
+	var checkpoint Checkpoint
+	if err := json.Unmarshal(data, &checkpoint); err != nil {
+		return nil, err
+	}
+
+	return &checkpoint, nil
+}
+
+func (cm *CheckpointManager) cleanupOldCheckpoints() {
+	// List all checkpoint files
+	files, err := filepath.Glob(filepath.Join(cm.dataDir, "checkpoint_*.json"))
+	if err != nil {
+		return
+	}
+
+	// Sort by modification time (oldest first)
+	sort.Slice(files, func(i, j int) bool {
+		infoI, _ := os.Stat(files[i])
+		infoJ, _ := os.Stat(files[j])
+		if infoI == nil || infoJ == nil {
+			return false
+		}
+		return infoI.ModTime().Before(infoJ.ModTime())
+	})
+
+	// Delete oldest if we exceed max
+	for len(files) >= cm.maxCheckpoints {
+		if err := os.Remove(files[0]); err == nil {
+			log.Printf("Deleted old checkpoint: %s", filepath.Base(files[0]))
+		}
+		files = files[1:]
+	}
+}
+
+// ============================================================
+// Adaptive Scheduler
+// ============================================================
+
+type AdaptiveScheduler struct {
+	config                   Config
+	currentMode              string
+	lastModeChange           time.Time
+	lastCheckpoint           time.Time
+	consecutiveFastDischarge int
+}
+
+func NewAdaptiveScheduler(config Config) *AdaptiveScheduler {
+	return &AdaptiveScheduler{
+		config:         config,
+		currentMode:    "normal",
+		lastModeChange: time.Now(),
+		lastCheckpoint: time.Now(),
+	}
+}
+
+func (as *AdaptiveScheduler) GetCurrentInterval() time.Duration {
+	switch as.currentMode {
+	case "aggressive":
+		return time.Duration(as.config.AggressiveInterval) * time.Second
+	case "emergency":
+		return time.Duration(as.config.EmergencyInterval) * time.Second
+	default:
+		return time.Duration(as.config.CheckpointInterval) * time.Second
+	}
+}
+
+func (as *AdaptiveScheduler) Update(dischargeInfo *DischargeInfo, isEmergency bool, acOnline bool) {
+	oldMode := as.currentMode
+
+	if isEmergency {
+		as.currentMode = "emergency"
+	} else if dischargeInfo.IsFast {
+		as.consecutiveFastDischarge++
+		if as.consecutiveFastDischarge >= 2 {
+			as.currentMode = "aggressive"
+		}
+	} else {
+		as.consecutiveFastDischarge = 0
+		as.currentMode = "normal"
+	}
+
+	// If not on battery, always normal mode
+	if acOnline {
+		as.currentMode = "normal"
+		as.consecutiveFastDischarge = 0
+	}
+
+	if oldMode != as.currentMode {
+		log.Printf("Mode change: %s -> %s", oldMode, as.currentMode)
+		as.lastModeChange = time.Now()
+	}
+}
+
+func (as *AdaptiveScheduler) ShouldCheckpoint() bool {
+	interval := as.GetCurrentInterval()
+	return time.Since(as.lastCheckpoint) >= interval
+}
+
+func (as *AdaptiveScheduler) RecordCheckpoint() {
+	as.lastCheckpoint = time.Now()
+}
+
+// ============================================================
+// Main Daemon
+// ============================================================
+
+type Daemon struct {
+	config            Config
+	batteryMonitor    *BatteryMonitor
+	processMonitor    *ProcessMonitor
+	windowMonitor     *WindowMonitor
+	checkpointManager *CheckpointManager
+	scheduler         *AdaptiveScheduler
+	running           bool
+	stopChan          chan bool
+}
+
+func NewDaemon(config Config) *Daemon {
+	return &Daemon{
+		config:            config,
+		batteryMonitor:    NewBatteryMonitor(config.FastDischargeRate, config.MinBatteryPercent),
+		processMonitor:    NewProcessMonitor(),
+		windowMonitor:     NewWindowMonitor(),
+		checkpointManager: NewCheckpointManager(config.DataDir, config.MaxCheckpoints, config.DryRun),
+		scheduler:         NewAdaptiveScheduler(config),
+		running:           true,
+		stopChan:          make(chan bool),
+	}
+}
+
+func (d *Daemon) Run() error {
+	log.Println("Daemon starting...")
+
+	// Setup signal handling
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, syscall.SIGTERM, syscall.SIGINT)
+
+	// Start monitoring loops
+	go d.batteryLoop()
+	go d.checkpointLoop()
+
+	// Wait for shutdown signal
+	<-sigChan
+	log.Println("Received shutdown signal")
+
+	// Save final checkpoint before exiting
+	log.Println("Saving final checkpoint...")
+	d.saveCheckpoint("shutdown")
+
+	d.running = false
+	close(d.stopChan)
+
+	log.Println("Daemon stopped")
+	return nil
+}
+
+func (d *Daemon) batteryLoop() {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	for d.running {
+		select {
+		case <-ticker.C:
+			sample, err := d.batteryMonitor.Read()
+			if err != nil {
+				log.Printf("Battery read error: %v", err)
+				continue
+			}
+
+			dischargeInfo := d.batteryMonitor.GetDischargeInfo()
+			isEmergency := d.batteryMonitor.CheckEmergency()
+			acOnline := d.batteryMonitor.IsACOnline()
+
+			// Log battery status
+			if dischargeInfo.RatePerMinute > 0 {
+				log.Printf("Battery: %.1f%% | Discharging: %.1f%%/min | AC: %v | Mode: %s",
+					sample.Percent, dischargeInfo.RatePerMinute, acOnline, d.scheduler.currentMode)
+			} else {
+				log.Printf("Battery: %.1f%% | AC: %v | Mode: %s",
+					sample.Percent, acOnline, d.scheduler.currentMode)
+			}
+
+			// Check for AC loss (immediate save)
+			if d.batteryMonitor.lastACStatus && !acOnline {
+				log.Printf("⚠️ AC power lost! Saving emergency checkpoint...")
+				d.saveCheckpoint("ac_loss")
+			}
+			d.batteryMonitor.lastACStatus = acOnline
+
+			// Update scheduler
+			d.scheduler.Update(dischargeInfo, isEmergency, acOnline)
+
+			// Emergency save for low battery
+			if isEmergency && !acOnline {
+				log.Printf("🚨 CRITICAL: Battery below %.1f%%! Saving emergency checkpoint...", d.config.MinBatteryPercent)
+				d.saveCheckpoint("low_battery")
+			}
+
+		case <-d.stopChan:
+			return
+		}
+	}
+}
+
+func (d *Daemon) checkpointLoop() {
+	for d.running {
+		if d.scheduler.ShouldCheckpoint() {
+			d.saveCheckpoint("periodic")
+			d.scheduler.RecordCheckpoint()
+		}
+		time.Sleep(1 * time.Second)
+	}
+}
+
+func (d *Daemon) saveCheckpoint(reason string) {
+	// Read current state
+	sample, err := d.batteryMonitor.Read()
+	if err != nil {
+		log.Printf("Failed to read battery for checkpoint: %v", err)
+		return
+	}
+
+	dischargeInfo := d.batteryMonitor.GetDischargeInfo()
+	acOnline := d.batteryMonitor.IsACOnline()
+
+	// Get running processes
+	processes, err := d.processMonitor.GetProcesses()
+	if err != nil {
+		log.Printf("Failed to get processes: %v", err)
+		processes = []Process{}
+	}
+
+	// Get active windows (optional)
+	activeWindows, _ := d.windowMonitor.GetActiveWindows()
+
+	// Create checkpoint
+	checkpoint := &Checkpoint{
+		Version:        1,
+		Timestamp:      time.Now(),
+		SaveReason:     reason,
+		BatteryPercent: sample.Percent,
+		BatteryVoltage: sample.Voltage,
+		DischargeRate:  dischargeInfo.RatePerMinute,
+		ACOnline:       acOnline,
+		Processes:      processes,
+		ActiveWindows:  activeWindows,
+	}
+
+	// Save
+	if err := d.checkpointManager.Save(checkpoint); err != nil {
+		log.Printf("Failed to save checkpoint: %v", err)
+	}
+}
+
+// ============================================================
+// Restore Function
+// ============================================================
+
+func restoreSession(config Config) error {
+	manager := NewCheckpointManager(config.DataDir, config.MaxCheckpoints, false)
+
+	checkpoint, err := manager.LoadLatest()
+	if err != nil {
+		return fmt.Errorf("no checkpoint found: %w", err)
+	}
+
+	log.Printf("========================================")
+	log.Printf("RESTORING SESSION FROM %s", checkpoint.Timestamp.Format("2006-01-02 15:04:05"))
+	log.Printf("========================================")
+	log.Printf("Battery at crash: %.1f%%", checkpoint.BatteryPercent)
+	log.Printf("Processes to restore: %d", len(checkpoint.Processes))
+
+	// Check if checkpoint is recent (within last hour)
+	if time.Since(checkpoint.Timestamp) > time.Hour {
+		log.Printf("Warning: Checkpoint is %v old", time.Since(checkpoint.Timestamp))
+	}
+
+	// Restore terminal sessions
+	for _, proc := range checkpoint.Processes {
+		if proc.Name == "bash" || proc.Name == "zsh" || proc.Name == "fish" {
+			log.Printf("  Terminal session: %s (PID %d, CWD: %s)", proc.Name, proc.PID, proc.CWD)
+		}
+	}
+
+	// Restore editors (VSCode)
+	for _, proc := range checkpoint.Processes {
+		if proc.Name == "code" || proc.Name == "code-insiders" {
+			log.Printf("  VSCode session detected - reopen with: %s", proc.Command)
+			if _, err := exec.LookPath("code"); err == nil {
+				log.Printf("  Launching VSCode...")
+				exec.Command("code", filepath.Dir(proc.CWD)).Start()
+			}
+		}
+	}
+
+	// Restore browsers
+	for _, proc := range checkpoint.Processes {
+		if proc.Name == "firefox" {
+			log.Printf("  Firefox detected - will restore tabs")
+			if _, err := exec.LookPath("firefox"); err == nil {
+				exec.Command("firefox").Start()
+			}
+		}
+		if proc.Name == "chrome" || proc.Name == "chromium" {
+			log.Printf("  Chrome/Chromium detected - will restore tabs")
+			if _, err := exec.LookPath("google-chrome"); err == nil {
+				exec.Command("google-chrome").Start()
+			}
+		}
+	}
+
+	log.Printf("========================================")
+	log.Printf("Session restoration complete")
+	log.Printf("========================================")
+
+	return nil
+}
+
+// ============================================================
+// Main Entry Point
+// ============================================================
+
+func main() {
+	// Command line arguments
+	interval := flag.Int("interval", 60, "Checkpoint interval (seconds)")
+	aggressive := flag.Int("aggressive-interval", 10, "Aggressive checkpoint interval (seconds)")
+	emergency := flag.Int("emergency-interval", 1, "Emergency checkpoint interval (seconds)")
+	minBattery := flag.Float64("min-battery", 5.0, "Minimum battery percentage")
+	fastDischarge := flag.Float64("fast-discharge", 15.0, "Fast discharge rate (%/min)")
+	dataDir := flag.String("data-dir", "/var/lib/power-failure-recovery", "Data directory")
+	maxCheckpoints := flag.Int("max-checkpoints", 10, "Maximum checkpoints to keep")
+	dryRun := flag.Bool("dry-run", false, "Don't actually save checkpoints")
+	restore := flag.Bool("restore", false, "Restore previous session on startup")
+	debug := flag.Bool("debug", false, "Enable debug logging")
+
+	flag.Parse()
+
+	// Build config
+	config := Config{
+		CheckpointInterval: *interval,
+		AggressiveInterval: *aggressive,
+		EmergencyInterval:  *emergency,
+		MinBatteryPercent:  *minBattery,
+		FastDischargeRate:  *fastDischarge,
+		DataDir:            *dataDir,
+		MaxCheckpoints:     *maxCheckpoints,
+		DryRun:             *dryRun,
+		RestoreOnStartup:   *restore,
+		Debug:              *debug,
+	}
+
+	// Create data directory
+	if err := os.MkdirAll(config.DataDir, 0755); err != nil {
+		log.Fatalf("Failed to create data directory: %v", err)
+	}
+
+	// Setup logging to file
+	logFile, err := os.OpenFile(filepath.Join(config.DataDir, "daemon.log"), os.O_CREATE|os.O_APPEND|os.O_WRONLY, 0644)
+	if err == nil {
+		log.SetOutput(logFile)
+		defer logFile.Close()
+	}
+
+	// Print banner
+	log.Println("========================================")
+	log.Println("Power Failure Recovery Daemon v1.0")
+	log.Println("========================================")
+	log.Printf("Checkpoint interval: %d seconds", config.CheckpointInterval)
+	log.Printf("Aggressive interval: %d seconds", config.AggressiveInterval)
+	log.Printf("Emergency interval: %d seconds", config.EmergencyInterval)
+	log.Printf("Min battery: %.1f%%", config.MinBatteryPercent)
+	log.Printf("Fast discharge: %.1f%%/min", config.FastDischargeRate)
+	log.Printf("Data directory: %s", config.DataDir)
+	log.Printf("Dry run: %v", config.DryRun)
+	log.Println("========================================")
+
+	// Restore if requested
+	if *restore {
+		log.Println("Restoring previous session...")
+		if err := restoreSession(config); err != nil {
+			log.Printf("Restore failed: %v", err)
+		} else {
+			log.Println("Session restored successfully")
+		}
+
+		// If only restoring, exit
+		if flag.NArg() == 0 && !*dryRun {
+			return
+		}
+	}
+
+	// Run daemon
+	daemon := NewDaemon(config)
+	if err := daemon.Run(); err != nil {
+		log.Fatalf("Daemon error: %v", err)
+	}
+}

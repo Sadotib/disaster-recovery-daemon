@@ -1,0 +1,9 @@
+{
+  "checkpoint_interval_secs": 60,
+  "aggressive_interval_secs": 10,
+  "emergency_interval_secs": 1,
+  "min_battery_percent": 5.0,
+  "fast_discharge_rate_per_min": 15.0,
+  "data_dir": "/var/lib/power-failure-recovery",
+  "max_checkpoints": 10
+}
