@@ -45,6 +45,16 @@ func main() {
 	log.Printf("Dry run: %v", cfg.DryRun)
 	log.Println("========================================")
 
+	// Handle save-now (one-off checkpoint)
+	if cfg.SaveNow {
+		log.Println("Saving immediate checkpoint...")
+		batteryMon := monitors.NewBatteryMonitor(cfg.FastDischargeRate, cfg.MinBatteryPercent)
+		processMon := monitors.NewProcessMonitor()
+		checkpointMgr := checkpoint.NewManager(cfg.DataDir, cfg.MaxCheckpoints, cfg.DryRun)
+		saveCheckpoint(checkpointMgr, processMon, batteryMon, "manual")
+		return
+	}
+
 	// Handle restore
 	if cfg.Restore {
 		log.Println("Restoring previous session...")

@@ -27,6 +27,7 @@ type Config struct {
 	DryRun  bool
 	Debug   bool
 	Restore bool
+	SaveNow bool
 }
 
 // DefaultConfig returns the default configuration
@@ -42,6 +43,7 @@ func DefaultConfig() *Config {
 		DryRun:             false,
 		Debug:              false,
 		Restore:            false,
+		SaveNow:            false,
 	}
 }
 
@@ -60,6 +62,7 @@ func Load() (*Config, error) {
 	dryRun := flag.Bool("dry-run", false, "Don't actually save")
 	debug := flag.Bool("debug", false, "Enable debug logging")
 	restore := flag.Bool("restore", false, "Restore previous session")
+	saveNow := flag.Bool("save-now", false, "Save a checkpoint immediately and exit")
 
 	flag.Parse()
 
@@ -112,6 +115,7 @@ func Load() (*Config, error) {
 	cfg.DryRun = *dryRun
 	cfg.Debug = *debug
 	cfg.Restore = *restore
+	cfg.SaveNow = *saveNow
 
 	// Create data directory
 	if err := os.MkdirAll(cfg.DataDir, 0755); err != nil {
