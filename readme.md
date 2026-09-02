@@ -1,6 +1,6 @@
-===============================================================================
+
 POWER FAILURE RECOVERY DAEMON
-===============================================================================
+
 
 WHAT IS THIS?
 
@@ -22,9 +22,9 @@ dies instantly. You lose:
 This program saves your state every 60 seconds so you never lose more than
 one minute of work.
 
-===============================================================================
+
 HOW IT WORKS (SIMPLE EXPLANATION)
-===============================================================================
+
 
 The program runs quietly in the background. Every 60 seconds it:
 1. Checks your battery percentage
@@ -47,9 +47,9 @@ If battery drains faster than normal, it saves more often:
 - Fast drain (15% per minute): Save every 10 seconds
 - Critical battery (below 5%): Save every 1 second
 
-===============================================================================
+
 WHAT IT ACTUALLY SAVES
-===============================================================================
+
 
 The program creates a checkpoint file (JSON format) containing:
 
@@ -124,9 +124,9 @@ Example:
     {"title": "GitHub - Firefox", "class": "Firefox", "pid": 5678}
   ]
 
-===============================================================================
+
 WHAT IT DOES NOT SAVE (YET)
-===============================================================================
+
 
 The following are NOT saved in the current version:
 
@@ -140,9 +140,9 @@ The following are NOT saved in the current version:
 
 These may be added in future versions.
 
-===============================================================================
+
 HOW MUCH DATA DOES IT STORE?
-===============================================================================
+
 
 Each checkpoint is typically 10KB to 100KB depending on how many processes
 are running. With the default setting of keeping 10 checkpoints, total
@@ -151,9 +151,9 @@ storage used is 1-2 MB. This is very small.
 Checkpoints are stored in:
 /var/lib/power-failure-recovery/
 
-===============================================================================
+
 CONFIGURATION OPTIONS
-===============================================================================
+
 
 You can change how the program behaves with these options:
 
@@ -177,9 +177,8 @@ You can change how the program behaves with these options:
 --debug                    Show detailed log messages
 --restore                  Restore previous session after a crash
 
-===============================================================================
+
 EXAMPLE USAGE
-===============================================================================
 
 Normal usage (save every 60 seconds):
   sudo ./power-recovery
@@ -201,9 +200,9 @@ Run as system service:
   sudo systemctl start power-failure-recovery
   sudo systemctl enable power-failure-recovery
 
-===============================================================================
+
 WHAT YOU GET AFTER A CRASH
-===============================================================================
+
 
 When your laptop dies and you reboot, here's what happens:
 
@@ -224,9 +223,9 @@ When your laptop dies and you reboot, here's what happens:
 
 4. You can manually reopen those applications
 
-===============================================================================
+
 REALISTIC EXPECTATIONS
-===============================================================================
+
 
 WITHOUT this program (normal Linux):
 - Lose everything you were doing
@@ -241,9 +240,9 @@ WITH this program:
 - Know which projects editors had open
 - Restore within 2-3 minutes
 
-===============================================================================
+
 LIMITATIONS (BEING HONEST)
-===============================================================================
+
 
 1. If your laptop dies instantly (no warning), you lose up to 60 seconds
    of work. This program cannot predict the future.
